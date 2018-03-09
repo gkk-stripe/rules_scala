@@ -4,12 +4,10 @@ import io.bazel.rulesscala.jar.JarCreator;
 import io.bazel.rulesscala.worker.GenericWorker;
 import io.bazel.rulesscala.worker.Processor;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
+import java.io.*;
 import java.lang.reflect.Field;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.FileSystems;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -17,10 +15,15 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.Map.Entry;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
 import scala.tools.nsc.Driver;
 import scala.tools.nsc.MainClass;
 import scala.tools.nsc.reporters.ConsoleReporter;
@@ -40,11 +43,58 @@ class ScalacProcessor implements Processor {
     }
   }
 
+  private void digestFile(MessageDigest md, File file) throws Exception {
+      // logging for debugging
+      {
+          MessageDigest localMd = MessageDigest.getInstance("SHA");
+          RandomAccessFile aFile = new RandomAccessFile(file, "r");
+          FileChannel inChannel = aFile.getChannel();
+          MappedByteBuffer buffer = inChannel.map(FileChannel.MapMode.READ_ONLY, 0, inChannel.size());
+          buffer.load();
+          localMd.update(buffer);
+          buffer.clear();
+          inChannel.close();
+          aFile.close();
+          String sha1 = bytesToHex(md.digest());
+          System.out.println("[digest]" + file + ": " + sha1);
+      }
+      RandomAccessFile aFile = new RandomAccessFile(file, "r");
+      FileChannel inChannel = aFile.getChannel();
+      MappedByteBuffer buffer = inChannel.map(FileChannel.MapMode.READ_ONLY, 0, inChannel.size());
+      buffer.load();
+      md.update(buffer);
+      buffer.clear();
+      inChannel.close();
+      aFile.close();
+  }
+
+  private void digestFileAtPath(MessageDigest md, String path) throws Exception {
+      File file = new File(path);
+      digestFile(md, file);
+  }
+
+  private String bytesToHex(byte[] bytes) {
+        StringBuilder result = new StringBuilder();
+        for (byte byt : bytes)
+            result.append(Integer.toHexString(0xFF & byt)).substring(1);
+      return result.toString();
+  }
+
+  private void digestFileCollections(MessageDigest md, List<File> ... fileCollections) throws Exception {
+      for (List<File> fileCollection : fileCollections) {
+          for (File file : fileCollection) {
+              digestFile(md, file);
+          }
+      }
+  }
+
   @Override
   public void processRequest(List<String> args) throws Exception {
     Path tmpPath = null;
     try {
       CompileOptions ops = new CompileOptions(args);
+
+      MessageDigest md = MessageDigest.getInstance("SHA");
 
       Path outputPath = FileSystems.getDefault().getPath(ops.outputName);
       tmpPath = Files.createTempDirectory(outputPath.getParent(), "tmp");
@@ -53,20 +103,55 @@ class ScalacProcessor implements Processor {
       List<File> scalaJarFiles = filterFilesByExtension(jarFiles, ".scala");
       List<File> javaJarFiles = filterFilesByExtension(jarFiles, ".java");
 
+      digestFileCollections(md, jarFiles, scalaJarFiles, javaJarFiles);
+
       String[] scalaSources = collectSrcJarSources(ops.files, scalaJarFiles, javaJarFiles);
 
+      for (String scalaSource : scalaSources) {
+          digestFileAtPath(md, scalaSource);
+      }
+
       String[] javaSources = GenericWorker.appendToString(ops.javaFiles, javaJarFiles);
+      for (String javaSource : javaSources) {
+          digestFileAtPath(md, javaSource);
+      }
       if (scalaSources.length == 0 && javaSources.length == 0) {
         throw new RuntimeException("Must have input files from either source jars or local files.");
       }
+
+      Path cacheDir = Paths.get("/Users/gkk/tmp/scalac-worker-cache");
+        String sha1 = bytesToHex(md.digest());
+        System.out.println(sha1);
+      String cacheKey = sha1;
+      File cacheKeyOnDisk = Paths.get(cacheDir.toString(), cacheKey).toFile();
+
+      File cacheTmpDirOnDisk = Paths.get(cacheKeyOnDisk.toString(), "scalac_output").toFile();
+      Path cacheStatsFileOnDisk = Paths.get(cacheKeyOnDisk.toString(), "stats_file");
+
 
       /**
        * Compile scala sources if available (if there are none, we will simply
        * compile java sources).
        */
-      if (scalaSources.length > 0) {
-        compileScalaSources(ops, scalaSources, tmpPath);
-      }
+        if (cacheKeyOnDisk.exists()) {
+            System.out.println("The " + cacheKeyOnDisk + " exists");
+            tmpPath.toFile().delete();
+            copyFolder(cacheTmpDirOnDisk, tmpPath.toFile());
+            Files.copy(cacheStatsFileOnDisk, Paths.get(ops.statsfile));
+        } else {
+            if (scalaSources.length > 0) {
+                compileScalaSources(ops, scalaSources, tmpPath);
+            }
+            try {
+                cacheKeyOnDisk.mkdir();
+                copyFolder(tmpPath.toFile(), cacheTmpDirOnDisk);
+                Files.copy(Paths.get(ops.statsfile), cacheStatsFileOnDisk);
+            } catch (Exception e) {
+                if (cacheKeyOnDisk.exists())
+                    removeTmp(cacheKeyOnDisk.toPath());
+                throw e;
+            }
+        }
 
       /**
        * Copy the resources
@@ -109,9 +194,34 @@ class ScalacProcessor implements Processor {
       }
     }
     finally {
-      removeTmp(tmpPath);
+        if (tmpPath.toFile().exists())
+            removeTmp(tmpPath);
     }
   }
+
+    private  void copyFolder(File src, File dest) throws IOException {
+//      System.out.println("copyFolder " + src + " " + dest);
+        Path absDest = dest.toPath().toAbsolutePath();
+        try (Stream<Path> stream = Files.walk(src.toPath())) {
+            stream.forEach(sourcePath -> {
+
+                try {
+                    Path target = absDest.resolve(src.toPath().relativize(sourcePath));
+//                    System.out.println("Copy " + absSrc + " to " + " " + target);
+                    Files.copy(
+                            /*Source Path*/
+                            sourcePath,
+                            /*Destination Path */
+                            target);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+
+            });
+
+        }
+
+    }
 
   private static String[] collectSrcJarSources(String[] files, List<File> scalaJarFiles, List<File> javaJarFiles) {
     String[] scalaSources = GenericWorker.appendToString(files, scalaJarFiles);
