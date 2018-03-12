@@ -8,12 +8,7 @@ import java.io.*;
 import java.lang.reflect.Field;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.FileSystems;
-import java.nio.file.FileVisitResult;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.SimpleFileVisitor;
+import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -57,6 +52,10 @@ class ScalacProcessor implements Processor {
           aFile.close();
           String sha1 = bytesToHex(md.digest());
           System.out.println("[digest]" + file + ": " + sha1);
+//          try (Stream<String> lines = Files.lines(file.toPath())) {
+//              System.out.println("### The file contents");
+//              lines.forEach(System.out::println);
+//          }
       }
       RandomAccessFile aFile = new RandomAccessFile(file, "r");
       FileChannel inChannel = aFile.getChannel();
@@ -69,6 +68,7 @@ class ScalacProcessor implements Processor {
   }
 
   private void digestFileAtPath(MessageDigest md, String path) throws Exception {
+
       File file = new File(path);
       digestFile(md, file);
   }
@@ -88,58 +88,78 @@ class ScalacProcessor implements Processor {
       }
   }
 
+  private void printTimeSinceStartup(long startTime, String label) {
+      long milisSinceStart = System.currentTimeMillis() - startTime;
+      System.out.println("[" + milisSinceStart + "]: " + label);
+  }
+
   @Override
   public void processRequest(List<String> args) throws Exception {
     Path tmpPath = null;
     try {
+        long startTime = System.currentTimeMillis();
+        printTimeSinceStartup(startTime,"Before CompileOptions creation");
       CompileOptions ops = new CompileOptions(args);
 
       MessageDigest md = MessageDigest.getInstance("SHA");
 
       Path outputPath = FileSystems.getDefault().getPath(ops.outputName);
+        printTimeSinceStartup(startTime,"Before createTempDirectory");
       tmpPath = Files.createTempDirectory(outputPath.getParent(), "tmp");
 
-      List<File> jarFiles = extractSourceJars(ops, outputPath.getParent());
-      List<File> scalaJarFiles = filterFilesByExtension(jarFiles, ".scala");
-      List<File> javaJarFiles = filterFilesByExtension(jarFiles, ".java");
+        {
+            List<File> sourceJarPaths =
+                    Stream.concat(Arrays.stream(ops.files), Arrays.stream(ops.sourceJars))
+                            .map(File::new).collect(Collectors.toList());
+            sourceJarPaths.forEach(System.out::println);
+            digestFileCollections(md, sourceJarPaths);
+        }
 
-      digestFileCollections(md, jarFiles, scalaJarFiles, javaJarFiles);
-
-      String[] scalaSources = collectSrcJarSources(ops.files, scalaJarFiles, javaJarFiles);
-
-      for (String scalaSource : scalaSources) {
-          digestFileAtPath(md, scalaSource);
-      }
-
-      String[] javaSources = GenericWorker.appendToString(ops.javaFiles, javaJarFiles);
-      for (String javaSource : javaSources) {
-          digestFileAtPath(md, javaSource);
-      }
-      if (scalaSources.length == 0 && javaSources.length == 0) {
-        throw new RuntimeException("Must have input files from either source jars or local files.");
-      }
-
-      Path cacheDir = Paths.get("/Users/gkk/tmp/scalac-worker-cache");
+        Path cacheDir = Paths.get("/Users/gkk/tmp/scalac-worker-cache");
         String sha1 = bytesToHex(md.digest());
-        System.out.println(sha1);
-      String cacheKey = sha1;
-      File cacheKeyOnDisk = Paths.get(cacheDir.toString(), cacheKey).toFile();
+        String cacheKey = sha1;
+        System.out.println(cacheKey);
+        File cacheKeyOnDisk = Paths.get(cacheDir.toString(), cacheKey).toFile();
 
-      File cacheTmpDirOnDisk = Paths.get(cacheKeyOnDisk.toString(), "scalac_output").toFile();
-      Path cacheStatsFileOnDisk = Paths.get(cacheKeyOnDisk.toString(), "stats_file");
+        File cacheTmpDirOnDisk = Paths.get(cacheKeyOnDisk.toString(), "scalac_output").toFile();
+        Path cacheStatsFileOnDisk = Paths.get(cacheKeyOnDisk.toString(), "stats_file");
 
-
-      /**
-       * Compile scala sources if available (if there are none, we will simply
-       * compile java sources).
-       */
+        /**
+         * Compile scala sources if available (if there are none, we will simply
+         * compile java sources).
+         */
         if (cacheKeyOnDisk.exists()) {
             System.out.println("The " + cacheKeyOnDisk + " exists");
+            printTimeSinceStartup(startTime,"Before tmpPath delete");
             tmpPath.toFile().delete();
             copyFolder(cacheTmpDirOnDisk, tmpPath.toFile());
-            Files.copy(cacheStatsFileOnDisk, Paths.get(ops.statsfile));
+            printTimeSinceStartup(startTime,"After cache folder copy");
+            Files.copy(cacheStatsFileOnDisk, Paths.get(ops.statsfile), StandardCopyOption.REPLACE_EXISTING);
         } else {
+
+
+            printTimeSinceStartup(startTime,"Before extractSourceJars");
+            List<File> jarFiles = extractSourceJars(ops, outputPath.getParent());
+            System.out.println("Printing extracted jar files");
+            jarFiles.forEach(System.out::println);
+            printTimeSinceStartup(startTime,"Before filterFilesByExtension(.scala)");
+            List<File> scalaJarFiles = filterFilesByExtension(jarFiles, ".scala");
+            printTimeSinceStartup(startTime,"Before filterFilesByExtension(.java)");
+            List<File> javaJarFiles = filterFilesByExtension(jarFiles, ".java");
+
+            String[] scalaSources = collectSrcJarSources(ops.files, scalaJarFiles, javaJarFiles);
+
+            printTimeSinceStartup(startTime,"Before scala sources hash");
+            printTimeSinceStartup(startTime,"After scala sources hash");
+
+            String[] javaSources = GenericWorker.appendToString(ops.javaFiles, javaJarFiles);
+
+            if (scalaSources.length == 0 && javaSources.length == 0) {
+                throw new RuntimeException("Must have input files from either source jars or local files.");
+            }
+
             if (scalaSources.length > 0) {
+                System.out.println("Compiling scalaSources");
                 compileScalaSources(ops, scalaSources, tmpPath);
             }
             try {
@@ -152,6 +172,8 @@ class ScalacProcessor implements Processor {
                 throw e;
             }
         }
+
+      System.out.println("After compile/restore from the cache");
 
       /**
        * Copy the resources
@@ -212,7 +234,9 @@ class ScalacProcessor implements Processor {
                             /*Source Path*/
                             sourcePath,
                             /*Destination Path */
-                            target);
+                            // TODO: replace is required because we were getting random FileAlreadyExists errors
+                            // could it be that following symlinks we end up copying the same file multiple times?
+                            target, StandardCopyOption.REPLACE_EXISTING);
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
